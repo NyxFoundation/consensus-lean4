@@ -1,3 +1,5 @@
 .lake/
 lake-packages/
 build/
+rust-ffi/target/
+rust-ffi/Cargo.lock

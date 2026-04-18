@@ -6,4 +6,6 @@ require aeneas from git
 
 package «consensus-lean4» {}
 
-@[default_target] lean_lib «ConsensusLean4» {}
+@[default_target]
+lean_lib «ConsensusLean4» where
+  globs := #[.submodules `ConsensusLean4]
