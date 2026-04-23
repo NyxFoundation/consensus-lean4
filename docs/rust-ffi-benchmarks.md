@@ -6,6 +6,7 @@ tags:
   - benchmark
   - aeneas
   - performance
+  - fast-path
 ---
 
 # Rust → Lean 4 FFI Benchmarks
@@ -191,6 +192,98 @@ Using **measured** per-(V²·A) constant ≈ 12 ns from `process_attestations` /
 The "infeasible at V≈1M" claim stands and was, if anything, understated. End-to-end
 processing of a single block at Ethereum scale (V≈1M, ~64 attestations) in the
 extracted Lean code would take of order ~10 days — for *one* state transition.
+
+## Fast-path implementation (Array-backed)
+
+`ConsensusLean4/FastPath.lean` provides `processAttestationsFast` — a
+hand-rolled Array-backed Lean implementation with the same input/output
+signature as the Aeneas-generated `state_transition.process_attestations`.
+Both coexist; the FFI layer exposes them under separate `csf_*` symbols
+(`csf_process_attestations` vs `csf_process_attestations_fast`). The benchmark
+harness runs a **parity check** on both after the timing sweep — every tested
+(V, A) pair returned identical result codes.
+
+### Why not `attribute [implemented_by ...]`?
+
+The original plan was to swap the fast impl in at runtime via
+`attribute [implemented_by processAttestationsFast] state_transition.process_attestations`.
+Lean 4 rejects this with:
+
+```
+Cannot add attribute [implemented_by] to declaration
+state_transition.process_attestations because it is in an imported module
+```
+
+Once a module's IR is compiled and imported, its runtime implementation is
+frozen. Editing `Funs.lean` to inline the attribute is forbidden by policy
+(Aeneas regenerates the file). So the fast impl is exposed as a parallel
+function rather than a hook — callers opt in by linking the fast symbol.
+
+### Algorithm (Array-backed)
+
+1. Convert every `Vec` field of `State` used by attestation processing to a
+   Lean `Array` at the boundary (O(V) per field).
+2. Unflatten `justifications_validators` into `Array (H256 × Array Bool)` —
+   O(R·V) instead of O(R·V²).
+3. For each attestation: `is_valid_vote` on arrays, then linear scan +
+   `Array.replicate V false` for the create-votes path (O(V)), then iterate
+   bits with `Array.set!` (O(V)), then count with `Array.get` (O(V)).
+   Total per attestation: **O(V)**.
+4. `serialize_justifications`: flatten arrays back into a single `Array Bool`
+   of size R·V, then Array → List → Vec (O(R·V) total).
+5. If the 2/3 threshold is reached during any attestation, bail out and
+   re-run the original slow Aeneas version from the initial state (identical
+   semantics for the try_finalize path, which the benchmark never exercises).
+
+### Speedup measurements
+
+Pipeline-only times (median of paired deltas), release build, same host.
+All cells show parity with the slow path (`result=0`). Columns: **slow**
+from `csf_process_attestations`, **fast** from `csf_process_attestations_fast`.
+
+| V | A | slow | fast | speedup |
+|---:|---:|---:|---:|---:|
+| 100 | 16 | 1.71 ms | 607 µs | 2.8× |
+| 100 | 64 | 6.90 ms | 2.43 ms | 2.8× |
+| 500 | 16 | 31.70 ms | 1.57 ms | **20×** |
+| 500 | 64 | 135.35 ms | 6.13 ms | **22×** |
+| 1,000 | 16 | 140.32 ms | 2.75 ms | **51×** |
+| 1,000 | 64 | 780.21 ms | 10.29 ms | **76×** |
+| 2,000 | 16 | 796.89 ms | 5.96 ms | **134×** |
+| 2,000 | 64 | **2.67 s** | **20.51 ms** | **130×** |
+
+### Fast-path scaling verification
+
+Per-(V²·A) drops from ~10 ns (slow, confirms O(A·V²)) to **~0.08 ns**
+at V=2000 — effectively dropping out of the quadratic regime. Per-(V·A)
+for the fast path at V≥1000 stabilizes around **~160 ns**, confirming
+linear O(A·V) scaling.
+
+### Re-derived V=1M extrapolation with fast path
+
+Using the measured ~160 ns/(V·A) from V≥1000:
+
+| V | A | slow projection | fast projection |
+|---:|---:|---:|---:|
+| 1,000 | 16 | 140 ms | 2.56 ms |
+| 100,000 | 16 | 32 min | 256 ms |
+| 1,000,000 | 16 | **2.2 days** | **~2.6 s** |
+| 1,000,000 | 64 | ~9 days | ~10 s |
+
+The fast path makes Ethereum-scale per-block processing tractable — a single
+block's attestation work in extracted Lean drops from days to seconds.
+
+### Correctness caveats for the fast path
+
+- The fast path handles the benchmark's "no finalization" input shape.
+- If `aggregation_bits` push the vote count past the 2/3 threshold, the fast
+  path **bails out and re-runs the slow Aeneas version** to avoid
+  reimplementing `try_finalize` / `remove_justification` / `set_justified`.
+  This preserves semantic equivalence at the cost of speedup for that case.
+- Parity with the slow version is currently verified by runtime result-code
+  comparison on sampled inputs, not by formal proof. A next step would be a
+  Lean theorem proving `processAttestationsFast state atts = state_transition.process_attestations state atts`
+  for all inputs, which the shared signature makes straightforward.
 
 ## Root cause and mitigations
 

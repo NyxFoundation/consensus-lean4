@@ -1,4 +1,5 @@
 import ConsensusLean4.Funs
+import ConsensusLean4.FastPath
 open Aeneas Aeneas.Std ethlambda_verification
 
 @[inline] private def u64OfUInt64 (n : UInt64) : Std.U64 :=
@@ -187,6 +188,19 @@ def processAttestationsC (v a : UInt64) : UInt8 := Id.run do
   | Result.fail _ => return 2 | Result.div => return 3
   | Result.ok atts =>
   return packPipeline (state_transition.process_attestations state atts)
+
+/-! ### Fast-path wrappers (Array-backed hand-rolled implementation). -/
+
+@[export csf_process_attestations_fast]
+def processAttestationsFastC (v a : UInt64) : UInt8 := Id.run do
+  if v == 0 then return 4
+  match mkGenesisState v.toNat with
+  | Result.fail _ => return 2 | Result.div => return 3
+  | Result.ok state =>
+  match mkAttestations a.toNat v.toNat with
+  | Result.fail _ => return 2 | Result.div => return 3
+  | Result.ok atts =>
+  return packPipeline (ConsensusLean4.FastPath.processAttestationsFast state atts)
 
 @[export csf_process_block]
 def processBlockC (v a : UInt64) : UInt8 := Id.run do
