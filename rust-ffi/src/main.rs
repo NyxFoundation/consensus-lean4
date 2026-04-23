@@ -23,6 +23,7 @@ extern "C" {
     fn csf_build_only_process_block_header(v: u64) -> u8;
     fn csf_build_only_process_attestations(v: u64, a: u64) -> u8;
     fn csf_build_only_process_block(v: u64, a: u64) -> u8;
+    fn csf_process_attestations_fast(v: u64, a: u64) -> u8;
 }
 
 fn scaling_table<F: Fn(u64) -> u64>(label: &str, sizes: &[u64], f: F) {
@@ -267,5 +268,29 @@ fn main() {
             &|v, a| time1(|| csf_build_only_state_transition(v, a)),
             warmup,
         );
+
+        // --- FAST PATH: Array-backed hand-rolled process_attestations ---
+        paired_bench_table_2d(
+            "process_attestations_FAST  (Array-backed; same inputs, same semantics)",
+            vs_att, as_att,
+            &|v, a| time1(|| csf_process_attestations_fast(v, a)),
+            &|v, a| time1(|| csf_build_only_process_attestations(v, a)),
+            warmup,
+        );
+
+        // --- Correctness check: slow and fast must return the same result code ---
+        println!("--- slow-vs-fast parity check ---");
+        let parity_cases: &[(u64, u64)] = &[(100, 0), (100, 1), (100, 4), (500, 4), (1_000, 1)];
+        let mut all_match = true;
+        for &(v, a) in parity_cases {
+            let slow = csf_process_attestations(v, a);
+            let fast = csf_process_attestations_fast(v, a);
+            let ok = slow == fast;
+            if !ok { all_match = false; }
+            println!("  V={v:>4}  A={a:>3}  slow={slow}  fast={fast}  {}",
+                     if ok { "ok" } else { "MISMATCH" });
+        }
+        if !all_match { println!("!! parity mismatch — fast path diverged from slow"); }
+        println!();
     }
 }
