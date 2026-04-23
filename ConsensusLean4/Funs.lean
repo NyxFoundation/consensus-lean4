@@ -11,8 +11,8 @@ set_option linter.unusedVariables false
 /- You can set the `maxHeartbeats` value with the `-max-heartbeats` CLI option -/
 set_option maxHeartbeats 1000000
 
-/- You can remove the following line by using the CLI option `-all-computable`: -/
-noncomputable section
+/- The original `noncomputable section` marker has been dropped because
+   FunsExternal.lean now supplies real implementations for every axiom. -/
 
 namespace ethlambda_verification
 
