@@ -1,3 +1,5 @@
 .lake/
 lake-packages/
 build/
+rust/target/
+rust/Cargo.lock
