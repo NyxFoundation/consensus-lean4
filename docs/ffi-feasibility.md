@@ -401,7 +401,7 @@ stateTransitionFast : State → Block → Result (Result Unit Error × State)
 | C2 | `hash_tree_root_*` が `ZERO` を返す stub | 絶対時間を過小評価 (SSZ hashing ~10-100 µs/State が欠落) | 「実 consensus では + X% 遅い」と注記 |
 | C3 | axiom `Vec::clear`, `Vec::is_empty`, `Ordering.eq`, `Result.branch`, `Result.from_residual` | 未実装で runtime panic の可能性 | PR #2 で real def に置換済。Aeneas 再生成で戻るので patch 自動化要 |
 | C4 | aggregation_bits 全 false で計測 → index_mut write path 未検証 | worst case 時間が未知 | seed で aggregation_bits を一部 true にするテストを別途 |
-| C5 | 署名検証なし (BLS なし) | 実 consensus より軽い | 注記のみ。導入は別スコープ |
+| C5 | 署名検証なし (BLS なし) | 実 consensus より軽い | 注記のみ。導入は別スコープ (詳細は §6.1) |
 | C6 | precompileModules + `@[extern]` の Issue #5509 | 特定構成で linker error | `precompileModules := false` を維持 |
 | C7 | Mathlib サイズ (Aeneas 経由で pull) | リンク時間 / バイナリサイズが大きい | build.rs で不要 object を除外 (PR #2 既存) |
 | C8 | compute_lmd_ghost_head のベンチは未計測 | ユーザー要件未達 | Option A の手順 3–4 で追加 |
@@ -410,6 +410,60 @@ stateTransitionFast : State → Block → Result (Result Unit Error × State)
 | C11 | lean-toolchain は v4.28.0-rc1 (RC) | 正式リリースで挙動変化の可能性 | **toolchain 変更は本メモとは別に単独承認** |
 | C12 | Rust 側 ToLean impl は Aeneas 出力の type 形状に依存 | `Types.lean` が再生成で変化すると Rust 側が壊れる | `Types.lean` diff を CI で監視 (C10 と同じ watcher)、Option III (SSZ) 移行で根本解決 |
 | C13 | Option II は marshal cost を計測外に置く設計 | 実 client の "Rust から Lean に State を渡す総コスト" とは別物になる | timer の置き方を明示、marshal 別途計測用の cell も用意 (`*_noop` twin) |
+
+### 6.1 C5 詳細: 署名検証の位置づけと Rust 連携モデル (参考)
+
+本プロジェクトでは BLS 署名検証を組み込まないが、**実 consensus client で組み込むとしたらどうなるか**の整理を残しておく。将来 spec 拡張を検討するときの参照用。
+
+#### spec 上どちらのエントリポイントに含まれるか
+
+- **state_transition 側が主担当**。Ethereum consensus の実 spec では `state_transition` (特に `process_block` 経路) で全ての block 内署名を verify する:
+  - Block proposer 署名 (`process_block_header` 内)
+  - 集約 Attestation 署名 (`process_attestations` 内、BLS12-381 集約)
+  - Altair+ では sync committee 署名、Deposit 署名、Voluntary exit 署名、Proposer/Attester slashing の各署名
+- **compute_lmd_ghost_head (fork_choice) は signature を verify しない**。前提として入力 attestations は**事前に attestation pool で verify 済**。fork choice は pure な graph / weight 計算に専念する ("pre-verified attestation pool" モデル)
+- 3SF-mini の Aeneas 生成コードでも fork_choice 側には signature 関連の logic は**存在しない**
+
+#### Rust 側 BLS 実装を連携させる 3 つの設計モデル
+
+現実の consensus client は BLS 実装 (例: `blst`, `milagro_bls`, `bls12_381`) を Rust で持つのが一般的。仮に本プロジェクトで連携するなら:
+
+**α. Lean から Rust の BLS 関数を `@[extern]` で呼び返す**
+```lean
+@[extern "consensus_bls_verify"]
+axiom consensusBlsVerify : @& ByteArray → @& ByteArray → @& ByteArray → Bool
+  -- pubkey / signature / message
+```
+```rust
+#[no_mangle]
+extern "C" fn consensus_bls_verify(pk: *const u8, sig: *const u8, msg: *const u8) -> u8 {
+    // blst の verify を呼ぶ
+}
+```
+Lean 側の `process_attestations` 等で `consensusBlsVerify` を呼ぶ。**問題**: attestation 数 × FFI 境界 = 大量の callback で境界コストが累積。1M validators × 複数 attestations のベンチに耐えない。
+
+**β. Rust 側で事前 verify、Lean には検証済入力のみ渡す (推奨される整合的モデル)**
+- Rust 側で block を受け取り、BLS verify を先に済ませる
+- verify OK → Lean に state/block を marshal (現行 Option II の拡張) → FFI 呼び出し → state 更新
+- verify NG → Lean を呼ばず reject
+- **Lean 側は signature を触らない**: spec 側の純粋さが保たれる
+- 現実の consensus client (Lighthouse, Prysm, Teku など) はすべて**この分担**で動いている
+
+利点:
+- 関心の分離 (cryptography は Rust、semantics は Lean)
+- FFI 境界は block 単位 (attestation 毎の境界跨ぎなし)
+- Lean の formalization target から BLS を exclude できる (証明対象を狭く保てる)
+
+**γ. Rust / Lean 両方で dual verify (研究用)**
+- 同じ署名を 2 重 verify、トラストモデル研究の題材
+- 実用価値低い (コスト重複、メリット薄)
+
+#### 結論
+
+- 本プロジェクトの FFI ベンチでは BLS は**組み込まない** (C5 通り)
+- もし将来組み込むなら **β モデル**が標準: Rust が gate-keeper として事前 verify、Lean は verify 済入力を受けて state を進める
+- Lean spec 側に BLS を入れる動機はない (Aeneas 形式化の対象を consensus semantics に絞るため)
+- spec の `process_attestations` / `process_block_header` に書かれている "signature verify" ステップは、**β の場合 Rust 側で先取り実行されるスキップ相当**として扱う
 
 ---
 
