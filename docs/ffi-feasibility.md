@@ -744,6 +744,79 @@ Rust binary が最終的に必要とするもの:
 
 `.lake/` と `target/` は `.gitignore` 対象 (既存 `.gitignore` で `.lake/` は除外済)。
 
+### 11.9 なぜ Lean は Rust より遅いのか (本タスクでの寄与源)
+
+「Lean が遅い」には 3 層あって、**言語ランタイムの構造的性質** + **Aeneas 翻訳の癖** + **本プロジェクト特有の stub 設計**が重なっている。
+
+#### レイヤー 1: Lean 言語ランタイムとして本質的に遅い理由
+
+**(1) ほとんど全ての値が heap 上の `lean_object *` (ref-counted)**
+
+プリミティブ (UInt*, Float, Bool, Char) だけ unboxed、それ以外 (ADT, Array, List, String, BitVec, 構造体) は全部 heap pointer。`state.validators` のような field access は「ポインタ参照 → ref count チェック → 次のポインタ参照」のチェーン。Rust なら struct field access = single `mov` 命令。
+
+**(2) Ref counting の更新コストが毎操作に乗る**
+
+ref count の +1/-1 は atomic instruction (~5 ns)。`{ s with slot := s.slot + 1 }` のような構造体更新でも発生。Rust の move semantics は +0 命令。
+
+**(3) 純粋関数型のセマンティクス → 共有されたデータの更新が O(n) コピー**
+
+```lean
+let s1 := { s with slot := newSlot }
+let s2 := { s with justified := newJ }
+```
+
+`s` が共有されている (refcount > 1) と、`s1`/`s2` 作成時に全 field を新 ctor にコピー。**"Functional But In-Place" (FBIP)** 最適化で refcount == 1 の時だけ in-place mutation に落ちるが、別所で参照していたらアウト。Rust は `&mut` で mutation がゼロコスト。
+
+**(4) 自動ベクトル化が効かない**
+
+Rust/LLVM は `for x in array { sum += x }` を AVX2 で 8 並列実行 (~0.1 ns/element)。Lean の `.c` 出力は heap pointer chase になっていて LLVM が SIMD 展開できない形。`process_attestations` の aggregation_bits ループがその典型 — Rust なら bit-parallel で数十倍速い。
+
+**(5) Cross-module inlining が弱い**
+
+Lean は `.olean` 単位でコンパイル、呼び出し先が別モジュールだと inline がかかりにくい。Rust は crate 単位 + LTO でほぼ全域 inline。
+
+**(6) Generic の dispatch が dictionary-passing**
+
+Lean は Haskell 型クラスと同じ方式で、`Add α` dictionary (vtable 相当) を引数に取って間接呼び出し。**monomorphize されない**。Rust は `add::<u64>` を具象化してインライン化。
+
+#### レイヤー 2: Aeneas 翻訳に特有の遅さ
+
+**(7) Rust `Vec<T>` → Lean `{ l : List α // ... }` 翻訳 (= C1 の根本原因)**
+
+Rust の `Vec<T>` は array backing で O(1) index + amortized O(1) push。Aeneas 翻訳は `List α` backing で **O(n) index**、**O(n) push**。`process_attestations` で `aggregation_bits[i]` を 1M 回読むと、1M × avg(N/2) = 500G の cons cell walk → O(A·N²)。N=1M で 2 日かかる直接原因。
+
+**これは Lean が遅いというより、Rust の mutable vector を Lean の functional list に写しているから**。PR #3 の fast path は「入り口で List → Array に詰め直す」ことで O(A·V) に落としている。
+
+**(8) `Std.U64` が `{ bv : BitVec 64 }` の wrapper**
+
+Aeneas は Rust の `u64` を `Std.U64 = { bv : BitVec 64 }` 構造体として翻訳。`BitVec 64` 自体は内部的に boxed な表現を取る場合があり、Rust の `u64` (64bit register) より重い。算術毎に refcount 操作が入ることもある。Lean コンパイラが最適化で unbox するパターンもあるが一貫しない。
+
+**(9) 証明付き構造体**
+
+`H256 = { val : Array U8 // val.size = 32 }` のような refinement type は実行時に proof 部分を erase するが、型情報の追跡や ctor のコストは残る。Rust の `[u8; 32]` は純粋な 32 バイトの inline storage で、Lean の `H256` は heap object。
+
+#### レイヤー 3: 本プロジェクト特有の事情
+
+**(10) `hash_tree_root_*` が stub**
+
+これは**逆に「stub だから速い」**。ZERO を返すだけなので SHA-256 + Merkleization のコストがゼロ。実 client (Rust の `blst` や `sha2` 利用) と比べると Lean は見かけ上速く出るが、実測はずれる。issue #5 で real 実装すると Lean 側も ~10–100 µs/call 増える。
+
+**(11) BLS / 署名検証なし**
+
+Rust 側で事前 verify するモデル (β、§6.1 参照) を想定しているので、Lean 側の処理には crypto が入っていない。これも見かけを速くしている (実際の fair 比較ではない)。
+
+#### 寄与度のまとめ
+
+| 寄与源 | 大きさ | 回避策 |
+|---|---|---|
+| Aeneas `Vec → List` → O(N²) (= C1) | **圧倒的** (N=2K で 134×、N=1M 外挿で 10⁵×) | PR #3 方式の Array fast path (本タスク Option X) |
+| heap alloc + refcount (Lean 一般) | ~5–10× vs Rust | 回避不能、言語選択の代償 |
+| SIMD / LTO なし | ~2–10× vs Rust | 回避不能 (Lean コンパイラの能力次第) |
+| generic dispatch | 関数による、~1.2–2× | `@[inline]` 明示で一部緩和 |
+| BitVec/BigInt 経由の算術 | 数値ヘビーな箇所で ~2–5× | Std.U64 → native UInt64 に unwrap できるなら |
+
+**一番の教訓**: Lean 言語本体の overhead (heap / refcount / no-SIMD) は **5–10× ぐらいで、現実的に飲める範囲**。本タスクで N=1M が数日かかるのは Lean のせいではなく**Aeneas が Rust の mutable vector を immutable list に翻訳した choice** が支配的で、Array に詰め替えれば桁違いに改善する。
+
 ---
 
 ## Next action (本メモ承認後)
