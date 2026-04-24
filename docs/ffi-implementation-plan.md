@@ -185,12 +185,39 @@ tags:
 
 1. 本計画をユーザーが承認 ✓ (2026-04-24)
 2. `feat/ffi-benchmarks` branch を切る
-3. M0 → M1 → M2 (遅延) → M3 → M4 → M5 の順に実装、各 M 完了時にユーザーに進捗報告
+3. M0 → M1 → **M2 (hard prereq、A20)** → M3 → M4 → M5 の順に実装、各 M 完了時にユーザーに進捗報告
 4. M5 完了後に **M0–M5 をまとめた 1 本の PR** を作成、レビュー待ち
 
-## 2026-04-24 決定事項 (A11–A14)
+## 2026-04-24 決定事項
+
+### 実装計画レベル (A11–A14)
 
 - **A11**: 工数見積もりはしない。M 完了毎に進捗報告
-- **A12**: M2 の axiom 置換は**遅延**。M3 / M4 で実際に必要になった axiom のみ置換
+- **A12 (更新、A20 で上書き)**: 旧「axiom 置換は遅延」。→ **A20 により M2 は M3 の hard prereq、5 axiom 全部置換**
 - **A13**: ベンチはローカル環境で実行 (CPU governor performance + taskset 推奨)
 - **A14**: M0–M5 を 1 本の PR にまとめる (`feat/ffi-benchmarks` → `main`)
+
+### 設計判断レベル (A15–A28)
+
+詳細は [`docs/ffi-feasibility.md` §8](./ffi-feasibility.md) を参照。本実装計画に影響する項目の要約:
+
+- **A15**: Bench ループは Option A (毎 iter で state/block を新規 alloc、FBIP fast path を踏む)
+- **A16**: `csf_state_transition` 戻り値は UInt8 sentinel (0=ok, 1=domain err, 2=panic, 3=div)、新 State は破棄
+- **A17**: Rust 側に `lean_object*` の RAII / dec_ref 規律は不要 (Option A では Lean が consume)
+- **A18**: ベンチ出力形式は人間可読 Markdown 表を stdout へ、`tee` でログ保存、手で docs に貼る
+- **A19**: `FastPath.lean` / `Ffi.lean` 冒頭に `set_option maxHeartbeats 1000000`
+- **A20**: M2 (FunsExternal 5 axiom 全部置換) を M3 の hard prereq に昇格
+- **A21**: build.rs が `../ConsensusLean4/` dir + lakefile/lean-toolchain/lake-manifest を watch
+- **A22**: build.rs 冒頭で `lake build` を自動 invoke
+- **A23**: Marshal.lean は作らない。Rust が Vec の ctor layout を直接組む (proof irrelevance により property = lean_box(0))
+- **A24**: Rust 側 `lean_list_nil` / `lean_list_cons` / `list_from_iter` で List 構築
+- **A25**: FFI 境界の所有権規約は owned / single-use、`lean_inc`/`lean_dec` は Rust 側で呼ばない
+- **A26**: モジュール初期化は top-level (`initialize_consensus_x2dlean4_ConsensusLean4_Ffi`) 1 本のみ、transitive は Lean runtime に任せる
+- **A27**: `*_noop` twin は入力を consume して UInt8=0 で即 return、paired-delta で pipeline 純粋時間を抽出
+- **A28**: PR #2 パターンを踏襲する informational 項目 — Result 2 重マッチ / `@[inline]` / 11 IR ディレクトリ走査
+
+## future work (本タスク外、issue で追跡)
+
+- [issue #4](https://github.com/NyxFoundation/consensus-lean4/issues/4): Option III (SSZ バイト列 FFI) 移行
+- [issue #5](https://github.com/NyxFoundation/consensus-lean4/issues/5): `hash_tree_root_*` real 実装
+- [issue #6](https://github.com/NyxFoundation/consensus-lean4/issues/6): realistic block-chaining benchmark (state chaining)
